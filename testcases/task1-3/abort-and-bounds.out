@@ -1,0 +1,10 @@
+================================
+ Welcome to CSIE Ledger System 
+================================
+Please enter your command: >>> Transaction started on account 902001.
+>>> Current balance: 500
+Please enter an operation: >>> [Error] Balance out of range.
+Please enter an operation: >>> [Error] Balance out of range.
+Please enter an operation: >>> Transaction aborted.
+Please enter your command: >>> Account 902001 balance: 500
+Please enter your command: >>> Client exit.

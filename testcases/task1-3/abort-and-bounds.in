@@ -1,0 +1,6 @@
+begin 902001
+add -501
+add 1000000
+abort
+read 902001
+exit
