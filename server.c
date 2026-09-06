@@ -23,11 +23,10 @@ int record_fd = -1;
  * account_owner[i]
  *
  * -1  : no client in this server process owns this account
- * >=0 : socket fd of the client that owns this account
+ * >=0 : socket fd of the client that currently owns this account
  *
- * Note:
- * fcntl record locks are process-associated. Therefore, an additional
- * ownership table is needed to distinguish clients within the same server.
+ * fcntl record locks are process-associated, so this extra table is
+ * needed to distinguish clients within the same server process.
  */
 static int account_owner[ACCOUNT_NUM];
 
@@ -112,7 +111,7 @@ int main(int argc, char **argv) {
      * Replace the temporary one-client-at-a-time loop below
      * with select() or poll().
      *
-     * Your event loop should monitor:
+     * The event loop should monitor:
      *
      *   1. svr.listen_fd
      *      -> accept a new client
@@ -130,12 +129,8 @@ int main(int argc, char **argv) {
      */
 
     /*
-     * --------------------------------------------------------
-     * Temporary starter implementation
-     *
-     * This is intentionally one-client-at-a-time.
+     * Temporary starter implementation.
      * Replace this entire loop for TODO 1.
-     * --------------------------------------------------------
      */
     while (1) {
         int conn_fd = accept_conn();
@@ -156,13 +151,11 @@ int main(int argc, char **argv) {
         if (ret > 0) {
             char command[MAX_MSG_LEN];
 
-            if (pop_command(reqP, command, sizeof(command)) > 0) {
+            while (pop_command(reqP, command, sizeof(command)) > 0) {
                 fprintf(stderr, "received: [%s]\n", command);
 
                 if (handle_command(reqP, command)) {
-                    close(conn_fd);
-                    free_request(reqP);
-                    continue;
+                    break;
                 }
             }
         }
@@ -198,6 +191,7 @@ static int recv_into_buffer(request *reqP) {
         if (errno == EINTR) {
             return 1;
         }
+
         return -1;
     }
 
@@ -246,6 +240,10 @@ static int recv_into_buffer(request *reqP) {
 }
 
 
+/* ============================================================
+ * Command extraction
+ * ============================================================ */
+
 /*
  * Return:
  *   1 : one complete command was extracted
@@ -253,47 +251,57 @@ static int recv_into_buffer(request *reqP) {
  *  -1 : malformed / command too long
  */
 static int pop_command(request *reqP, char *command, size_t command_size) {
+    char *newline = memchr(reqP->buf, '\n', reqP->buf_len);
+
+    if (newline == NULL) {
+        if (reqP->buf_len >= sizeof(reqP->buf)) {
+            return -1;
+        }
+
+        return 0;
+    }
+
+    size_t line_len = (size_t)(newline - reqP->buf);
+    size_t command_len = line_len;
+
     /*
-     * ========================================================
-     * TODO 3: Extract one complete command
-     * ========================================================
+     * Support CRLF input:
      *
-     * Find the first '\n' in reqP->buf.
+     *     command\r\n
      *
-     * If there is no '\n':
-     *
-     *     return 0
-     *
-     * Otherwise:
-     *
-     *     1. copy one command into `command`
-     *     2. remove the trailing '\n'
-     *     3. also remove an optional '\r'
-     *     4. preserve bytes after the command
+     * Remove the optional '\r' before '\n'.
+     */
+    if (command_len > 0 && reqP->buf[command_len - 1] == '\r') {
+        command_len--;
+    }
+
+    if (command_len >= command_size) {
+        return -1;
+    }
+
+    memcpy(command, reqP->buf, command_len);
+    command[command_len] = '\0';
+
+    /*
+     * Remove the consumed command from reqP->buf while preserving
+     * any leftover bytes.
      *
      * Example:
      *
-     *     reqP->buf =
-     *         "read 902001\nexit\n"
+     *     read 902001\nexit\n
      *
-     * First call:
+     * becomes:
      *
-     *     command =
-     *         "read 902001"
-     *
-     * Afterwards:
-     *
-     *     reqP->buf =
-     *         "exit\n"
-     *
-     * memchr() and memmove() may be useful.
+     *     exit\n
      */
+    size_t consumed = line_len + 1;
+    size_t remaining = reqP->buf_len - consumed;
 
-    (void)reqP;
-    (void)command;
-    (void)command_size;
+    memmove(reqP->buf, reqP->buf + consumed, remaining);
 
-    return 0;
+    reqP->buf_len = remaining;
+
+    return 1;
 }
 
 
@@ -309,7 +317,7 @@ static int pop_command(request *reqP, char *command, size_t command_size) {
 static int handle_command(request *reqP, const char *command) {
     /*
      * ========================================================
-     * TODO 4: READY / TRANSACTION state machine
+     * TODO 3: READY / TRANSACTION state machine
      * ========================================================
      *
      * READY:
@@ -327,7 +335,7 @@ static int handle_command(request *reqP, const char *command) {
      *     exit
      *
      *
-     * Recommended structure:
+     * Suggested structure:
      *
      *     if (reqP->state == READY) {
      *         ...
@@ -337,8 +345,6 @@ static int handle_command(request *reqP, const char *command) {
      *         ...
      *     }
      *
-     *
-     * Important behavior:
      *
      * read:
      *     acquire F_RDLCK
@@ -399,6 +405,7 @@ static int parse_int_strict(const char *text, int *value) {
     }
 
     *value = (int)result;
+
     return 0;
 }
 
@@ -415,6 +422,7 @@ static int parse_account_id(const char *text, int *account_id) {
     }
 
     *account_id = id;
+
     return 0;
 }
 
@@ -477,15 +485,14 @@ static int try_record_lock(int account_id, short lock_type) {
 
     /*
      * ========================================================
-     * TODO 5: Acquire a nonblocking byte-range record lock
+     * TODO 4: Acquire a nonblocking byte-range record lock
      * ========================================================
      *
      * Use:
      *
      *     fcntl(record_fd, F_SETLK, &lock)
      *
-     * F_SETLK must be used instead of F_SETLKW because the
-     * assignment requires a nonblocking lock attempt.
+     * F_SETLK must be used instead of F_SETLKW.
      *
      * If errno is EACCES or EAGAIN:
      *
@@ -516,7 +523,7 @@ static int unlock_record(int account_id) {
 
     /*
      * ========================================================
-     * TODO 6: Release the byte-range record lock
+     * TODO 5: Release the byte-range record lock
      * ========================================================
      *
      * Use fcntl() with F_SETLK.
@@ -533,7 +540,7 @@ static int unlock_record(int account_id) {
 static void cleanup_transaction(request *reqP) {
     /*
      * ========================================================
-     * TODO 7: Transaction cleanup
+     * TODO 6: Transaction cleanup
      * ========================================================
      *
      * If this client is currently in TRANSACTION:
@@ -629,8 +636,8 @@ static int accept_conn(void) {
     }
 
     /*
-     * If this fd number was previously used by another client,
-     * reset its request state before reuse.
+     * fd numbers may be reused after close(), so always reset
+     * the request state before assigning the new connection.
      */
     init_request(&requestP[conn_fd]);
 
